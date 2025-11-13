@@ -1,2 +1,4 @@
 /node_modules
 /.vscode
+transcriber-app/node_modules
+transcriber-app/dist
