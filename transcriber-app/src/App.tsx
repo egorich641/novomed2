@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { GoogleGenAI, Modality, type LiveServerMessage, type LiveSession } from '@google/genai';
 import MicIcon from './components/icons/MicIcon';
 import StopIcon from './components/icons/StopIcon';
 import DownloadIcon from './components/icons/DownloadIcon';
@@ -11,7 +10,6 @@ import CancelIcon from './components/icons/CancelIcon';
 import type { TranscriptEntry } from './types';
 
 type TranscriptionMode = 'live' | 'file';
-type GenAIBlob = { data: string; mimeType: string };
 
 declare global {
   interface Window {
@@ -20,7 +18,7 @@ declare global {
   }
 }
 
-const API_KEY = import.meta.env.VITE_API_KEY as string | undefined;
+const TRANSCRIBE_ENDPOINT = (import.meta.env.VITE_TRANSCRIBE_ENDPOINT as string | undefined) || '/api/transcribe';
 
 const speakerColors = ['#60a5fa', '#f87171', '#4ade80', '#c084fc', '#fb923c'];
 
@@ -29,26 +27,6 @@ const getSpeakerColor = (speaker: string): string => {
   if (!speakerNumMatch) return '#9ca3af';
   const speakerNum = parseInt(speakerNumMatch[0], 10);
   return speakerColors[(speakerNum - 1) % speakerColors.length];
-};
-
-const encode = (bytes: Uint8Array): string => {
-  let binary = '';
-  bytes.forEach((byte) => {
-    binary += String.fromCharCode(byte);
-  });
-  return btoa(binary);
-};
-
-const createBlob = (data: Float32Array): GenAIBlob => {
-  const int16 = new Int16Array(data.length);
-  for (let i = 0; i < data.length; i += 1) {
-    const clipped = Math.max(-1, Math.min(1, data[i]));
-    int16[i] = clipped < 0 ? clipped * 0x8000 : clipped * 0x7fff;
-  }
-  return {
-    data: encode(new Uint8Array(int16.buffer)),
-    mimeType: 'audio/pcm;rate=16000',
-  };
 };
 
 const App: React.FC = () => {
@@ -66,11 +44,9 @@ const App: React.FC = () => {
   const [editingText, setEditingText] = useState('');
   const [editingSpeaker, setEditingSpeaker] = useState('');
 
-  const liveSessionRef = useRef<LiveSession | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
-  const tempTranscriptionRef = useRef('');
+  const recordedChunksRef = useRef<Blob[]>([]);
 
   const docxReady = Boolean(window.docx?.Packer && window.docx?.Document);
   const fileSaverReady = typeof window.saveAs === 'function';
@@ -84,134 +60,113 @@ const App: React.FC = () => {
     }
   }, [docxReady, fileSaverReady]);
 
-  const appendToTranscript = useCallback((text: string) => {
-    if (!text.trim()) return;
-    setTranscript((prev) => [
-      ...prev,
-      {
-        speaker: 'Спикер',
-        text: text.trim(),
-        timestamp: new Date().toLocaleTimeString('ru-RU'),
-      },
-    ]);
-  }, []);
-
-  const handleStopRecording = useCallback(async () => {
+  const handleStopRecording = useCallback(() => {
     if (!isRecording) return;
 
     setIsRecording(false);
     setStatus('Обработка финальной транскрипции...');
 
-    if (liveSessionRef.current) {
-      liveSessionRef.current.close();
-      liveSessionRef.current = null;
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+      recorderRef.current.stop();
     }
 
     if (micStreamRef.current) {
       micStreamRef.current.getTracks().forEach((track) => track.stop());
       micStreamRef.current = null;
     }
+  }, [isRecording]);
 
-    if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
-      scriptProcessorRef.current = null;
-    }
+  const sendBlobForTranscription = useCallback(
+    async (audioBlob: Blob, source: 'live' | 'file', fileName?: string) => {
+      const formData = new FormData();
+      formData.append('audio', audioBlob, fileName || `${source}-recording.webm`);
 
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      await audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
+      setStatus('Отправка на серверную транскрипцию...');
 
-    const trimmedText = tempTranscriptionRef.current.trim();
-    if (trimmedText) {
-      appendToTranscript(trimmedText);
-    }
-    tempTranscriptionRef.current = '';
-    setCurrentTranscription('');
+      try {
+        const response = await fetch(TRANSCRIBE_ENDPOINT, {
+          method: 'POST',
+          body: formData,
+        });
 
-    setStatus('Запись остановлена. Готов к скачиванию или началу новой транскрипции.');
-  }, [appendToTranscript, isRecording]);
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || 'Сервер вернул ошибку');
+        }
+
+        const data = (await response.json()) as { transcript?: string };
+        const text = data.transcript?.trim();
+
+        if (text) {
+          setTranscript([
+            {
+              speaker: 'Спикер',
+              text,
+              timestamp: new Date().toLocaleTimeString('ru-RU'),
+            },
+          ]);
+          setStatus('Транскрипция завершена.');
+          setCurrentTranscription('');
+        } else {
+          setStatus('Транскрипция завершена, но текст пуст.');
+        }
+      } catch (error) {
+        console.error('Ошибка транскрипции:', error);
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(`Ошибка: ${message}`);
+      }
+    },
+    [],
+  );
 
   const handleStartRecording = useCallback(async () => {
     if (isRecording) return;
     setTranscript([]);
     setCurrentTranscription('');
-    tempTranscriptionRef.current = '';
     setStatus('Инициализация...');
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = stream;
 
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      audioContextRef.current = audioContext;
+      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      recorderRef.current = recorder;
+      recordedChunksRef.current = [];
 
-      const ai = new GoogleGenAI({ apiKey: API_KEY as string });
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordedChunksRef.current.push(event.data);
+        }
+      };
 
-      const session = await ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-        callbacks: {
-          onopen: () => {
-            setStatus('Подключено. Говорите в микрофон.');
-            setIsRecording(true);
+      recorder.onstop = async () => {
+        const blob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
+        recordedChunksRef.current = [];
+        await sendBlobForTranscription(blob, 'live');
+      };
 
-            const source = audioContext.createMediaStreamSource(stream);
-            const processor = audioContext.createScriptProcessor(4096, 1, 1);
-            scriptProcessorRef.current = processor;
+      recorder.onerror = (event) => {
+        console.error('Ошибка записи аудио:', event.error);
+        setStatus(`Ошибка записи аудио: ${event.error?.message ?? 'неизвестная ошибка'}`);
+      };
 
-            processor.onaudioprocess = (event) => {
-              const inputData = event.inputBuffer.getChannelData(0);
-              const pcmBlob = createBlob(inputData);
-              if (liveSessionRef.current) {
-                liveSessionRef.current.sendRealtimeInput({ media: pcmBlob });
-              }
-            };
-
-            source.connect(processor);
-            processor.connect(audioContext.destination);
-          },
-          onmessage: (message: LiveServerMessage) => {
-            const text = message.serverContent?.inputTranscription?.text;
-            if (text) {
-              tempTranscriptionRef.current += text;
-              setCurrentTranscription(tempTranscriptionRef.current);
-            }
-            if (message.serverContent?.turnComplete) {
-              const trimmed = tempTranscriptionRef.current.trim();
-              if (trimmed) {
-                appendToTranscript(trimmed);
-              }
-              tempTranscriptionRef.current = '';
-              setCurrentTranscription('');
-            }
-          },
-          onerror: (error: ErrorEvent) => {
-            console.error('Ошибка API:', error);
-            setStatus(`Ошибка: ${error.message}. Пожалуйста, попробуйте снова.`);
-            handleStopRecording().catch((err) => console.error('Ошибка остановки записи', err));
-          },
-          onclose: () => {
-            console.log('Соединение с API закрыто.');
-          },
-        },
-        config: {
-          responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
-        },
-      });
-
-      liveSessionRef.current = session;
+      recorder.start();
+      setStatus('Запись началась. Говорите в микрофон.');
+      setCurrentTranscription('Запись активна...');
+      setIsRecording(true);
     } catch (error) {
       console.error('Ошибка начала записи:', error);
       setStatus('Ошибка: Не удалось получить доступ к микрофону. Проверьте разрешения.');
-      await handleStopRecording();
+      if (micStreamRef.current) {
+        micStreamRef.current.getTracks().forEach((track) => track.stop());
+        micStreamRef.current = null;
+      }
     }
-  }, [appendToTranscript, handleStopRecording, isRecording]);
+  }, [isRecording, sendBlobForTranscription]);
 
   const handleClearTranscript = () => {
     setTranscript([]);
     setCurrentTranscription('');
-    tempTranscriptionRef.current = '';
     setStatus('Транскрипция очищена.');
   };
 
@@ -316,18 +271,6 @@ const App: React.FC = () => {
     }
   };
 
-  const blobToBase64 = (blob: Blob): Promise<string> =>
-    new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const result = reader.result as string;
-        const [, base64] = result.split(',');
-        resolve(base64 ?? '');
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-
   const handleTranscribeFile = async () => {
     if (!selectedFile && !fileUrl) {
       setStatus('Пожалуйста, выберите файл или укажите URL.');
@@ -349,53 +292,12 @@ const App: React.FC = () => {
         setStatus('Загрузка файла по URL...');
         const response = await fetch(fileUrl);
         if (!response.ok) throw new Error(`Не удалось загрузить файл: ${response.statusText}`);
-        audioBlob = await response.blob();
-        mimeType = response.headers.get('Content-Type') || audioBlob.type || 'audio/mpeg';
+        const arrayBuffer = await response.arrayBuffer();
+        mimeType = response.headers.get('Content-Type') || 'audio/mpeg';
+        audioBlob = new Blob([arrayBuffer], { type: mimeType });
       }
 
-      setStatus('Конвертация и отправка в Gemini...');
-      const base64Data = await blobToBase64(audioBlob);
-      const ai = new GoogleGenAI({ apiKey: API_KEY as string });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-pro',
-        contents: {
-          parts: [
-            {
-              text:
-                "Транскрибируй это аудио. Если в аудио несколько говорящих, раздели их реплики, начиная каждую с новой строки в формате 'Спикер N: [текст реплики]'. Если говорящий один, просто предоставь сплошной текст транскрипции.",
-            },
-            { inlineData: { mimeType, data: base64Data } },
-          ],
-        },
-      });
-
-      setStatus('Обработка ответа...');
-      const resultText = response.text ?? '';
-      let newTranscript: TranscriptEntry[];
-
-      if (/Спикер\s\d+:/.test(resultText)) {
-        newTranscript = resultText
-          .split('\n')
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .map((line) => {
-            const [speaker, ...textParts] = line.split(':');
-            return {
-              speaker: speaker.trim(),
-              text: textParts.join(':').trim(),
-            };
-          });
-      } else {
-        newTranscript = [
-          {
-            speaker: 'Спикер',
-            text: resultText.trim(),
-          },
-        ];
-      }
-
-      setTranscript(newTranscript);
-      setStatus('Транскрипция файла завершена.');
+      await sendBlobForTranscription(audioBlob, 'file', selectedFile?.name || 'file-upload.webm');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`Ошибка: ${message}`);
@@ -430,19 +332,6 @@ const App: React.FC = () => {
     });
     handleEditCancel();
   };
-
-  if (!API_KEY) {
-    return (
-      <div className="min-h-screen bg-gray-900 text-gray-100 flex items-center justify-center p-4">
-        <div className="bg-red-900 border border-red-700 p-6 rounded-2xl shadow-lg text-center max-w-md">
-          <h1 className="text-2xl font-bold mb-2 text-red-300">Ошибка конфигурации</h1>
-          <p className="text-red-200">
-            Ключ API Gemini не найден. Пожалуйста, убедитесь, что переменная окружения <code>VITE_API_KEY</code> установлена правильно.
-          </p>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col p-4 md:p-8 font-sans">
